@@ -4,6 +4,7 @@ stubbed here since test_linux.py covers their internals; these tests pin the seq
 drives and how it turns each outcome into a bool / SetupResult, with a FakePrompter and no hardware.
 """
 import sys
+from contextlib import contextmanager
 from dataclasses import replace
 
 import pytest
@@ -158,7 +159,7 @@ async def test_uninstall_narrow_removes_only_self(monkeypatch):
     monkeypatch.setattr(lin, "target_for_vidpid", lambda v, p: _target())
     monkeypatch.setattr(lin, "plan_uninstall", lambda t: _Plan(siblings=[_Sib("rt3070", "RT3070")]))
     monkeypatch.setattr(lin, "remove_rule",
-                        lambda t, *, node, also_keys: seen.update(also=also_keys) or _Result(ok=True, message="removed"))
+                        lambda t, *, node, also_keys, method=None: seen.update(also=also_keys) or _Result(ok=True, message="removed"))
     monkeypatch.setattr(lin.SetupLinux, "_wait_for_access", _access_ok)
     res = await lin.SetupLinux().uninstall(_DEV, FakePrompter(ask="narrow"))
     assert res.ok and seen["also"] == ()
@@ -169,7 +170,7 @@ async def test_uninstall_wide_passes_sibling_keys(monkeypatch):
     monkeypatch.setattr(lin, "target_for_vidpid", lambda v, p: _target())
     monkeypatch.setattr(lin, "plan_uninstall", lambda t: _Plan(siblings=[_Sib("rt3070", "RT3070")]))
     monkeypatch.setattr(lin, "remove_rule",
-                        lambda t, *, node, also_keys: seen.update(also=also_keys) or _Result(ok=True, message="removed"))
+                        lambda t, *, node, also_keys, method=None: seen.update(also=also_keys) or _Result(ok=True, message="removed"))
     monkeypatch.setattr(lin.SetupLinux, "_wait_for_access", _access_ok)
     res = await lin.SetupLinux().uninstall(_DEV, FakePrompter(ask="wide"))
     assert res.ok and seen["also"] == ("rt3070",)
@@ -182,6 +183,83 @@ async def test_uninstall_not_revoked_message(monkeypatch):
     monkeypatch.setattr(lin.SetupLinux, "_wait_for_access", _access_never)
     res = await lin.SetupLinux().uninstall(_DEV, FakePrompter(ask="narrow"))
     assert res.ok and "fully revoke access" in res.message
+
+
+# ---- TUI suspend around elevation ---------------------------------------------------------
+
+class SuspendPrompter(FakePrompter):
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self.suspended = 0
+
+    @contextmanager
+    def suspend(self):
+        self.suspended += 1
+        yield
+
+
+def _nonroot_sudo(monkeypatch):
+    monkeypatch.setattr(lin.os, "geteuid", lambda: 1000, raising=False)
+    monkeypatch.setattr(lin, "_choose_escalation_method", lambda: "sudo")
+
+
+async def test_install_suspends_only_for_sudo(monkeypatch):
+    _nonroot_sudo(monkeypatch)
+    monkeypatch.setattr(lin, "target_for_vidpid", lambda v, p: _target())
+    seen = {}
+    monkeypatch.setattr(lin, "install_rule",
+                         lambda t, *, node, method=None: seen.update(method=method) or _Result(ok=True))
+    monkeypatch.setattr(lin.SetupLinux, "_wait_for_access", _access_ok)
+    ui = SuspendPrompter()
+    assert await lin.SetupLinux().install(_DEV, ui) is _DEV
+    assert seen["method"] == "sudo" and ui.suspended == 1
+
+
+async def test_install_stays_visible_for_pkexec(monkeypatch):
+    monkeypatch.setattr(lin.os, "geteuid", lambda: 1000, raising=False)
+    monkeypatch.setattr(lin, "_choose_escalation_method", lambda: "pkexec")
+    monkeypatch.setattr(lin, "target_for_vidpid", lambda v, p: _target())
+    seen = {}
+    monkeypatch.setattr(lin, "install_rule",
+                         lambda t, *, node, method=None: seen.update(method=method) or _Result(ok=True))
+    monkeypatch.setattr(lin.SetupLinux, "_wait_for_access", _access_ok)
+    ui = SuspendPrompter()
+    assert await lin.SetupLinux().install(_DEV, ui) is _DEV
+    assert seen["method"] == "pkexec" and ui.suspended == 0
+
+
+async def test_install_as_root_never_suspends(monkeypatch):
+    monkeypatch.setattr(lin.os, "geteuid", lambda: 0, raising=False)
+    monkeypatch.setattr(lin, "_choose_escalation_method", lambda: "sudo")
+    monkeypatch.setattr(lin, "target_for_vidpid", lambda v, p: _target())
+    monkeypatch.setattr(lin, "install_rule", lambda *a, **k: _Result(ok=True))
+    monkeypatch.setattr(lin.SetupLinux, "_wait_for_access", _access_ok)
+    ui = SuspendPrompter()
+    assert await lin.SetupLinux().install(_DEV, ui) is _DEV
+    assert ui.suspended == 0
+
+
+async def test_uninstall_suspends_only_for_sudo(monkeypatch):
+    _nonroot_sudo(monkeypatch)
+    monkeypatch.setattr(lin, "target_for_vidpid", lambda v, p: _target())
+    monkeypatch.setattr(lin, "plan_uninstall", lambda t: _Plan())
+    monkeypatch.setattr(lin, "remove_rule", lambda *a, **k: _Result(ok=True, message="removed"))
+    monkeypatch.setattr(lin.SetupLinux, "_wait_for_access", _access_ok)
+    ui = SuspendPrompter(ask="narrow")
+    assert (await lin.SetupLinux().uninstall(_DEV, ui)).ok
+    assert ui.suspended == 1
+
+
+async def test_uninstall_stays_visible_for_pkexec(monkeypatch):
+    monkeypatch.setattr(lin.os, "geteuid", lambda: 1000, raising=False)
+    monkeypatch.setattr(lin, "_choose_escalation_method", lambda: "pkexec")
+    monkeypatch.setattr(lin, "target_for_vidpid", lambda v, p: _target())
+    monkeypatch.setattr(lin, "plan_uninstall", lambda t: _Plan())
+    monkeypatch.setattr(lin, "remove_rule", lambda *a, **k: _Result(ok=True, message="removed"))
+    monkeypatch.setattr(lin.SetupLinux, "_wait_for_access", _access_ok)
+    ui = SuspendPrompter(ask="narrow")
+    assert (await lin.SetupLinux().uninstall(_DEV, ui)).ok
+    assert ui.suspended == 0
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="os.geteuid is POSIX-only")

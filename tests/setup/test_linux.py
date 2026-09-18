@@ -12,7 +12,9 @@ on those exact Linux semantics, so faking them faithfully off-Linux isn't possib
 skips on Windows, and these run on the Linux CI leg instead.
 """
 import sys
+from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -243,13 +245,60 @@ def test_run_privileged_missing_runner_returns_127(monkeypatch):
     assert run_privileged("x", "pkexec") == 127
 
 
-def test_choose_escalation_method_prefers_pkexec_then_sudo_then_none(monkeypatch):
+def _gui_env(monkeypatch):
+    monkeypatch.setenv("DISPLAY", ":0")
+    monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
+    monkeypatch.delenv("SSH_CONNECTION", raising=False)
+    monkeypatch.delenv("SSH_TTY", raising=False)
+
+
+def _headless_env(monkeypatch):
+    monkeypatch.delenv("DISPLAY", raising=False)
+    monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
+    monkeypatch.delenv("SSH_CONNECTION", raising=False)
+    monkeypatch.delenv("SSH_TTY", raising=False)
+
+
+def test_has_gui_session_needs_local_display_without_ssh(monkeypatch):
+    _headless_env(monkeypatch)
+    assert lin._has_gui_session() is False
+    monkeypatch.setenv("DISPLAY", ":0")
+    assert lin._has_gui_session() is True
+    monkeypatch.setenv("SSH_CONNECTION", "1.2.3.4 1 5.6.7.8 22")
+    assert lin._has_gui_session() is False
+    monkeypatch.delenv("SSH_CONNECTION")
+    monkeypatch.delenv("DISPLAY")
+    monkeypatch.setenv("WAYLAND_DISPLAY", "wayland-0")
+    assert lin._has_gui_session() is True
+    monkeypatch.setenv("SSH_TTY", "/dev/pts/0")
+    assert lin._has_gui_session() is False
+
+
+def test_choose_escalation_method_gui_prefers_pkexec_then_sudo_then_none(monkeypatch):
+    _gui_env(monkeypatch)
     monkeypatch.setattr(lin.shutil, "which", lambda n: "/x" if n in ("pkexec", "sudo") else None)
     assert _choose_escalation_method() == "pkexec"
     monkeypatch.setattr(lin.shutil, "which", lambda n: "/x" if n == "sudo" else None)
     assert _choose_escalation_method() == "sudo"
     monkeypatch.setattr(lin.shutil, "which", lambda n: None)
     assert _choose_escalation_method() is None
+
+
+def test_choose_escalation_method_headless_prefers_sudo_then_pkexec_then_none(monkeypatch):
+    _headless_env(monkeypatch)
+    monkeypatch.setattr(lin.shutil, "which", lambda n: "/x" if n in ("pkexec", "sudo") else None)
+    assert _choose_escalation_method() == "sudo"
+    monkeypatch.setattr(lin.shutil, "which", lambda n: "/x" if n == "pkexec" else None)
+    assert _choose_escalation_method() == "pkexec"
+    monkeypatch.setattr(lin.shutil, "which", lambda n: None)
+    assert _choose_escalation_method() is None
+
+
+def test_choose_escalation_method_ssh_prefers_sudo(monkeypatch):
+    _gui_env(monkeypatch)
+    monkeypatch.setenv("SSH_CONNECTION", "1.2.3.4 1 5.6.7.8 22")
+    monkeypatch.setattr(lin.shutil, "which", lambda n: "/x" if n in ("pkexec", "sudo") else None)
+    assert _choose_escalation_method() == "sudo"
 
 
 # --- install_rule classification ---------------------------------------------------------------
@@ -471,3 +520,63 @@ def test_remove_rule_wide_clears_the_family(monkeypatch, tmp_path):
 def test_linux_setup_result_defaults():
     r = SetupResult(ok=True, message="x")
     assert r.ok and not r.cancelled and r.detail is None
+
+
+# --- TUI suspend around elevation ------------------------------------------------------------
+
+@contextmanager
+def _recording_cm(seen):
+    seen.append("enter")
+    yield
+    seen.append("exit")
+
+
+def test_suspended_uses_prompter_hook_and_is_noop_without_it():
+    ui = SimpleNamespace()
+    with lin._suspended(ui):
+        pass  # legacy/fake prompters expose no suspend: elevation runs inline
+    seen = []
+    ns = SimpleNamespace(suspend=lambda: _recording_cm(seen))
+    with lin._suspended(ns):
+        seen.append("body")
+    assert seen == ["enter", "body", "exit"]
+
+
+def test_elevation_context_suspends_only_for_sudo_as_nonroot(monkeypatch):
+    seen = []
+    ui = SimpleNamespace(suspend=lambda: _recording_cm(seen))
+    monkeypatch.setattr(lin.os, "geteuid", lambda: 1000, raising=False)
+    with lin._elevation_context(ui, "sudo"):
+        seen.append("body")
+    assert seen == ["enter", "body", "exit"]
+    for method in ("pkexec", None):          # GUI agent dialog / no elevator: TUI stays up
+        seen.clear()
+        with lin._elevation_context(ui, method):
+            seen.append("body")
+        assert seen == ["body"]
+    monkeypatch.setattr(lin.os, "geteuid", lambda: 0, raising=False)
+    seen.clear()
+    with lin._elevation_context(ui, "sudo"):
+        seen.append("body")
+    assert seen == ["body"]                  # root elevates inline: no suspend
+
+
+def test_install_rule_uses_explicit_method(monkeypatch, tmp_path):
+    _force_linux_nonroot(monkeypatch, tmp_path)
+    monkeypatch.setattr(lin, "_choose_escalation_method", lambda: "pkexec")
+    seen = {}
+    monkeypatch.setattr(lin, "run_privileged", lambda cmd, method: seen.update(method=method) or 0)
+    assert install_rule(_target(), method="sudo").ok
+    assert seen["method"] == "sudo"
+
+
+def test_remove_rule_uses_explicit_method(monkeypatch, tmp_path):
+    monkeypatch.setattr(lin.sys, "platform", "linux")
+    monkeypatch.setattr(lin.os, "geteuid", lambda: 1000, raising=False)
+    _point_paths_at_tmp(monkeypatch, tmp_path)
+    Path(rule_path("ar9271")).write_text("x")
+    monkeypatch.setattr(lin, "_choose_escalation_method", lambda: "pkexec")
+    seen = {}
+    monkeypatch.setattr(lin, "run_privileged", lambda cmd, method: seen.update(method=method) or 0)
+    assert remove_rule(_target(), method="sudo").ok
+    assert seen["method"] == "sudo"

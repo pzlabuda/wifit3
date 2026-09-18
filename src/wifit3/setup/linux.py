@@ -31,6 +31,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -260,12 +261,42 @@ def _remove_cmd(keys: list[str], node: str | None) -> str:
     return " && ".join(steps)
 
 
+def _has_gui_session() -> bool:
+    """Whether a polkit agent could pop a dialog: a local display and not an SSH session."""
+    env = os.environ
+    if env.get("SSH_CONNECTION") or env.get("SSH_TTY"):
+        return False
+    return bool(env.get("DISPLAY") or env.get("WAYLAND_DISPLAY"))
+
+
 def _choose_escalation_method() -> str | None:
-    if shutil.which("pkexec"):
-        return "pkexec"
-    if shutil.which("sudo"):
-        return "sudo"
-    return None
+    """``pkexec`` under a GUI (its dialog owns the prompt); ``sudo`` over SSH/TTY, where pkexec has
+    no agent and the TUI would swallow the password keystrokes. Each falls back to the other."""
+    pkexec = shutil.which("pkexec")
+    sudo = shutil.which("sudo")
+    if _has_gui_session():
+        return "pkexec" if pkexec else ("sudo" if sudo else None)
+    return "sudo" if sudo else ("pkexec" if pkexec else None)
+
+
+@contextmanager
+def _suspended(ui):
+    """The prompter's TUI-suspend context around elevation, else a no-op (fake/headless prompters
+    expose no ``suspend``). Suspended, sudo owns the real terminal so its password prompt works."""
+    susp = getattr(ui, "suspend", None)
+    if susp is None:
+        yield
+    else:
+        with susp():
+            yield
+
+
+def _elevation_context(ui, method):
+    """Suspend the TUI only for a terminal sudo prompt as non-root: pkexec's agent dialog and the
+    already-root inline path need no suspend, so the TUI stays visible under X."""
+    if method == "sudo" and os.geteuid() != 0:
+        return _suspended(ui)
+    return nullcontext()
 
 
 def run_privileged(shell_cmd: str, method: str) -> int:
@@ -443,10 +474,12 @@ def _residual_blocked(own_modules: set[str], removed_keys: set[str]) -> dict[str
 
 # --- public install / remove --------------------------------------------------------------------
 
-def install_rule(target: SetupTarget, *, node: str | None = None) -> SetupResult:
+def install_rule(target: SetupTarget, *, node: str | None = None,
+                 method: str | None = None) -> SetupResult:
     """Hand ``target``'s chipset to wifit3: write the per-chipset blacklist + udev access rule under
     one elevation prompt, reload udev, and best-effort unload the kernel module. The card needs a
-    physical replug afterwards to reach a clean cold state (the caller asks for it)."""
+    physical replug afterwards to reach a clean cold state (the caller asks for it). ``method`` is
+    the pkexec/sudo choice the caller already suspended for; None chooses internally."""
     if not sys.platform.startswith("linux"):
         raise RuntimeError("install_rule is Linux-only")
 
@@ -477,7 +510,8 @@ def install_rule(target: SetupTarget, *, node: str | None = None) -> SetupResult
         if is_root:
             rc = _run_as_root(cmd)
         else:
-            method = _choose_escalation_method()
+            if method is None:
+                method = _choose_escalation_method()
             if method is None:
                 return SetupResult(
                     ok=False, detail=_manual_hint(target.key),
@@ -505,7 +539,7 @@ def install_rule(target: SetupTarget, *, node: str | None = None) -> SetupResult
 
 
 def remove_rule(target: SetupTarget, *, node: str | None = None,
-                also_keys: tuple[str, ...] = ()) -> SetupResult:
+                also_keys: tuple[str, ...] = (), method: str | None = None) -> SetupResult:
     """Return ``target``'s chipset (and any ``also_keys`` siblings) to the kernel: delete their
     per-chipset blacklist + access-rule pairs and reload udev. The normal Wi-Fi driver rebinds on the
     next replug.
@@ -548,7 +582,8 @@ def remove_rule(target: SetupTarget, *, node: str | None = None,
                 else SetupResult(ok=False, detail=rpath,
                                       message=f"Couldn't remove the udev rule + blocklist (exit {rc})."))
 
-    method = _choose_escalation_method()
+    if method is None:
+        method = _choose_escalation_method()
     if method is None:
         rmpaths = " ".join(shlex.quote(p) for k in keys for p in (rule_path(k), blacklist_path(k)))
         return SetupResult(
@@ -616,7 +651,10 @@ class SetupLinux(Setup):
             return None
 
         ui.status(f"Installing udev rule + blocklist for {chip}…")
-        result = await asyncio.to_thread(install_rule, target, node=usb_node_path(device_id))
+        method = _choose_escalation_method()
+        with _elevation_context(ui, method):
+            result = await asyncio.to_thread(install_rule, target, node=usb_node_path(device_id),
+                                             method=method)
         if not result.ok:
             if not result.cancelled:
                 ui.error("Couldn't install the device rules", result.message)
@@ -659,8 +697,10 @@ class SetupLinux(Setup):
         ui.status(f"Removing wifit3 rules for {device_id.description}…")
         # Wide radius also removes the sibling chipsets so the shared kernel module is freed.
         also = tuple(s.key for s in plan.siblings) if choice == "wide" else ()
-        result = await asyncio.to_thread(
-            remove_rule, target, node=usb_node_path(device_id), also_keys=also)
+        method = _choose_escalation_method()
+        with _elevation_context(ui, method):
+            result = await asyncio.to_thread(
+                remove_rule, target, node=usb_node_path(device_id), also_keys=also, method=method)
         if not result.ok:
             return result
 

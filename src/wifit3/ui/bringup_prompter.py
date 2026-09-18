@@ -3,6 +3,8 @@ bring-up path that touches Textual. It carries no decisions (the "humble object"
 pushes a screen or updates a label. DeviceManager owns its lifecycle via open()/close()."""
 from __future__ import annotations
 
+import logging
+from contextlib import contextmanager
 from typing import TYPE_CHECKING
 
 from wifit3.ui.screens.bringup_progress import BringupProgressModal
@@ -11,6 +13,8 @@ from wifit3.ui.screens.setup_error import SetupErrorDialog
 
 if TYPE_CHECKING:
     from wifit3.models import DeviceID
+
+logger = logging.getLogger(__name__)
 
 
 class BringupPrompter:
@@ -37,6 +41,23 @@ class BringupPrompter:
         if self._modal is not None:
             self._modal.set_progress(fraction)
             self._modal.set_status(message)
+
+    @contextmanager
+    def suspend(self):
+        """Drop the alternate screen so sudo's password prompt owns the real terminal. Falls back
+        to a no-op where suspend is unsupported (headless test driver)."""
+        try:
+            cm = self._app.suspend()
+            cm.__enter__()
+        except Exception:
+            logger.debug("bringup: TUI suspend unsupported; elevating inline", exc_info=True)
+            yield
+            return
+        try:
+            yield
+        finally:
+            # Clean args so a body error still resumes the driver; it keeps propagating after.
+            cm.__exit__(None, None, None)
 
     def error(self, title: str, body: str) -> None:
         # Take down the progress modal first so the error dialog isn't buried under it.

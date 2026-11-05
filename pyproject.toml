@@ -7,7 +7,8 @@ license = "GPL-2.0-only"
 license-files = ["LICENSE"]
 requires-python = ">=3.11"
 dependencies = [
-    "libusb-package>=1.0.26.3",
+    "libusb-package>=1.0.26.3; platform_machine != 'i686'",
+    "libusb-package==1.0.26.3; platform_machine == 'i686'",
     "platformdirs",
     "pyusb>=1.3.1",
     "rich",

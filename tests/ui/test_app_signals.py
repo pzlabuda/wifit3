@@ -27,11 +27,17 @@ async def test_termination_signal_closes_cards_before_exit(sig):
 @pytest.mark.usefixtures("no_usb_devices")
 async def test_second_termination_signal_falls_back_to_default():
     app = WifiteApp()
-    app.action_quit = AsyncMock()  # a quit wedged on a card: never exits
+    quits = []
+
+    async def wedged_quit():  # a quit wedged on a card: never exits
+        quits.append(True)
+
+    # A real coroutine function, not AsyncMock: inspect.signature crashes on one before 3.11.3.
+    app.action_quit = wedged_quit
     async with app.run_test() as pilot:
         os.kill(os.getpid(), signal.SIGTERM)
         await pilot.pause(0.1)
-        app.action_quit.assert_awaited_once()
+        assert quits == [True]
         assert signal.getsignal(signal.SIGTERM) == signal.SIG_DFL
         assert signal.getsignal(signal.SIGHUP) == signal.SIG_DFL
 

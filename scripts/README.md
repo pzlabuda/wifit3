@@ -24,6 +24,8 @@ scripts/
 ├─ ui/           Rendering helpers: render_cardart.py (.ans card art -> PNG), wiffy_preview.py.
 ├─ generators/   Generators that (re)write source under src/ (e.g. the WPS OUI table).
 ├─ dev.py        Shared helpers any script imports (currently the card picker).
+├─ vendor_libusb_package.py  Build libusb-package's i686 Linux wheel from source into
+│                vendor/wheels/, repoint pyproject.toml at it, re-lock (needs Docker, x86_64).
 └─ release.py    Bump __version__, commit, tag; pushing the vX.Y.Z tag builds + publishes.
 ```
 

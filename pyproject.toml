@@ -7,7 +7,7 @@ license = "GPL-2.0-only"
 license-files = ["LICENSE"]
 requires-python = ">=3.11"
 dependencies = [
-    "libusb-package>=1.0.30.0",
+    "libusb-package>=1.0.30.1",
     "platformdirs",
     "pyusb>=1.3.1",
     "rich",
@@ -25,11 +25,6 @@ build-backend = "hatchling.build"
 # there is one source of truth. The release workflow's tag-gate reads the same literal.
 [tool.hatch.version]
 path = "src/wifit3/__init__.py"
-
-[tool.uv.sources]
-# No upstream i686 Linux wheel since 1.0.26.4 (pyocd/libusb-package#40): built and vendored by
-# scripts/vendor_libusb_package.py, which also rewrites this path and the >= floor above.
-libusb-package = { path = "vendor/wheels/libusb_package-1.0.30.0-py3-none-manylinux2014_i686.manylinux_2_17_i686.whl", marker = "platform_machine == 'i686'" }
 
 [dependency-groups]
 dev = [

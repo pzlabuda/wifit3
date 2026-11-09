@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Build libusb-package's i686 Linux wheel from source into vendor/wheels/ and re-lock.
 
-Upstream ships no i686 Linux wheel since 1.0.26.4 (pyocd/libusb-package#40).
+For releases with no i686 Linux wheel, like 1.0.26.4 to 1.0.30.0 (pyocd/libusb-package#40).
 """
 import argparse
 import os
@@ -19,6 +19,11 @@ UPSTREAM = "https://github.com/pyocd/libusb-package.git"
 CIBUILDWHEEL = "cibuildwheel@4.1.0"
 SOURCE_LINE = re.compile(r'^(libusb-package = \{ path = ")([^"]+)(".*)$', re.M)
 FLOOR_LINE = re.compile(r'^(\s*"libusb-package>=)[^"]+(",)$', re.M)
+SOURCES_ENTRY = """[tool.uv.sources]
+# Vendored by scripts/vendor_libusb_package.py, which also rewrites this path and the floor.
+libusb-package = {{ path = "{path}", marker = "platform_machine == 'i686'" }}
+
+"""
 
 
 def run(*cmd: str, cwd: Path | None = None, env: dict | None = None) -> None:
@@ -57,17 +62,25 @@ def vendor(wheel: Path) -> Path:
 
 def point_pyproject_at(wheel: Path, version: str) -> None:
     text = PYPROJECT.read_text()
-    if not SOURCE_LINE.search(text) or not FLOOR_LINE.search(text):
-        sys.exit("pyproject.toml lacks the libusb-package [tool.uv.sources] entry or >= floor")
+    if not FLOOR_LINE.search(text):
+        sys.exit('pyproject.toml lacks the "libusb-package>=..." dependency')
     rel = wheel.relative_to(REPO).as_posix()
-    text = SOURCE_LINE.sub(lambda m: f"{m[1]}{rel}{m[3]}", text)
+    if SOURCE_LINE.search(text):
+        text = SOURCE_LINE.sub(lambda m: f"{m[1]}{rel}{m[3]}", text)
+    elif "[tool.uv.sources]" in text:
+        sys.exit("[tool.uv.sources] exists without a libusb-package entry: add it by hand")
+    elif "\n[dependency-groups]" in text:
+        entry = SOURCES_ENTRY.format(path=rel)
+        text = text.replace("\n[dependency-groups]", f"\n{entry}[dependency-groups]", 1)
+    else:
+        text = f"{text.rstrip()}\n\n{SOURCES_ENTRY.format(path=rel).rstrip()}\n"
     text = FLOOR_LINE.sub(lambda m: f"{m[1]}{version}{m[2]}", text)
     PYPROJECT.write_text(text)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--version", default="1.0.30.0", help="libusb-package release tag, no 'v'")
+    parser.add_argument("--version", required=True, help="libusb-package release tag, no 'v'")
     args = parser.parse_args()
 
     for tool in ("git", "docker", "uvx", "uv"):
